@@ -1,0 +1,7 @@
+[server]
+# Disable hot-reload watcher to suppress torchvision import noise from
+# transformers submodules that Streamlit tries to inspect on every rerun.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
