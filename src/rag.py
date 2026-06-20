@@ -1,11 +1,12 @@
 """
 rag.py — Retrieval-Augmented Generation over the natural-farming knowledge base.
 
-Uses ChromaDB (local, persistent, free) with a small multilingual sentence-
-transformer so a Telugu/Hindi query can match the English knowledge base.
+Uses sentence-transformers + numpy for vector search. No ChromaDB, no
+opentelemetry, no protobuf — works on any Python version including 3.14,
+and deploys cleanly on Streamlit Community Cloud.
 
-The knowledge base is the heart of "not a ChatGPT wrapper": every answer is
-grounded in curated, source-noted documents, not the model's open memory.
+37 chunks at 384 dimensions = ~57 KB index. Numpy cosine search over that
+is sub-millisecond; ChromaDB would be overkill and broke on Python 3.14.
 """
 
 from __future__ import annotations
@@ -13,22 +14,32 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import chromadb
-from chromadb.utils import embedding_functions
+import numpy as np
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import (
-    KB_DIR, CHROMA_DIR, COLLECTION_NAME, EMBED_MODEL,
+    KB_DIR, EMBED_MODEL,
     CHUNK_SIZE, CHUNK_OVERLAP, RETRIEVAL_K, MAX_DISTANCE_FOR_CONFIDENCE,
 )
 
+INDEX_FILE = Path(__file__).resolve().parent.parent / "vector_index.npz"
+
+_model = None
+
+
+def _get_model():
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer(EMBED_MODEL)
+    return _model
+
 
 # ---------------------------------------------------------------------------
-# Chunking
+# Chunking (unchanged logic)
 # ---------------------------------------------------------------------------
 def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split on paragraph boundaries, then pack into ~size-char chunks with overlap."""
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     chunks, current = [], ""
     for para in paragraphs:
@@ -37,7 +48,6 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
         else:
             if current:
                 chunks.append(current)
-            # carry a little overlap for context continuity
             tail = current[-overlap:] if current else ""
             current = (tail + "\n\n" + para).strip() if tail else para
     if current:
@@ -46,11 +56,9 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
 
 
 def _load_kb_chunks() -> list[dict]:
-    """Read every markdown file in the KB and return chunk dicts with metadata."""
     records = []
     for md_path in sorted(KB_DIR.glob("*.md")):
         raw = md_path.read_text(encoding="utf-8")
-        # Use the first H1 as a human-readable source title.
         title_match = re.search(r"^#\s+(.+)$", raw, re.MULTILINE)
         title = title_match.group(1).strip() if title_match else md_path.stem
         for i, chunk in enumerate(_chunk_text(raw)):
@@ -66,40 +74,40 @@ def _load_kb_chunks() -> list[dict]:
 # ---------------------------------------------------------------------------
 # Index build / load
 # ---------------------------------------------------------------------------
-def _embedding_fn():
-    return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-
-
 def build_index(reset: bool = True) -> int:
-    """(Re)build the Chroma collection from the knowledge base. Returns chunk count."""
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    if reset:
-        try:
-            client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=_embedding_fn(),
-        metadata={"hnsw:space": "cosine"},
-    )
+    """Build a numpy vector index from the knowledge base. Returns chunk count."""
     records = _load_kb_chunks()
-    collection.add(
-        ids=[r["id"] for r in records],
-        documents=[r["text"] for r in records],
-        metadatas=[{"source": r["source"], "file": r["file"]} for r in records],
+    texts = [r["text"] for r in records]
+    sources = [r["source"] for r in records]
+
+    embeddings = _get_model().encode(
+        texts, normalize_embeddings=True, show_progress_bar=False
+    )
+
+    np.savez_compressed(
+        str(INDEX_FILE),
+        embeddings=embeddings.astype(np.float32),
+        sources=np.array(sources),
+        texts=np.array(texts),
     )
     return len(records)
 
 
-def get_collection():
-    """Open the persistent collection (assumes build_index has been run)."""
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=_embedding_fn(),
-        metadata={"hnsw:space": "cosine"},
-    )
+class _Index:
+    """Thin wrapper so app.py can call collection.count() unchanged."""
+    def count(self) -> int:
+        if not INDEX_FILE.exists():
+            return 0
+        try:
+            data = np.load(str(INDEX_FILE), allow_pickle=False)
+            return int(len(data["texts"]))
+        except Exception:
+            return 0
+
+
+def get_collection() -> _Index:
+    """Return an object with a .count() method (mirrors the old ChromaDB API)."""
+    return _Index()
 
 
 # ---------------------------------------------------------------------------
@@ -108,28 +116,36 @@ def get_collection():
 def retrieve(query: str, k: int = RETRIEVAL_K) -> dict:
     """
     Return retrieved context plus a confidence flag.
-
-    confident == False signals the support-tier escalation logic that the query
-    is likely out of scope and a human should be suggested.
+    confident == False triggers Tier-3 human escalation.
     """
-    collection = get_collection()
-    res = collection.query(query_texts=[query], n_results=k)
+    if not INDEX_FILE.exists():
+        build_index()
 
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    dists = res.get("distances", [[]])[0]
+    data = np.load(str(INDEX_FILE), allow_pickle=False)
+    embeddings = data["embeddings"]        # (n, d) float32, already L2-normalised
+    sources = data["sources"].tolist()
+    texts = data["texts"].tolist()
 
-    if not docs:
-        return {"context": "", "sources": [], "confident": False, "best_distance": None}
+    query_emb = _get_model().encode(
+        [query], normalize_embeddings=True
+    ).astype(np.float32)                   # (1, d)
 
-    best_distance = min(dists) if dists else None
-    confident = best_distance is not None and best_distance <= MAX_DISTANCE_FOR_CONFIDENCE
+    # Cosine similarity = dot product when both sides are L2-normalised
+    scores = np.dot(embeddings, query_emb.T).flatten()
+    distances = 1.0 - scores              # cosine distance in [0, 2]
 
-    context = "\n\n---\n\n".join(docs)
-    sources = [m.get("source", "") for m in metas]
+    top_k = min(k, len(texts))
+    top_idx = np.argsort(distances)[:top_k]
+
+    best_distance = float(distances[top_idx[0]])
+    confident = best_distance <= MAX_DISTANCE_FOR_CONFIDENCE
+
+    context = "\n\n---\n\n".join(texts[i] for i in top_idx)
+    retrieved_sources = [sources[i] for i in top_idx]
+
     return {
         "context": context,
-        "sources": sources,
+        "sources": retrieved_sources,
         "confident": confident,
         "best_distance": best_distance,
     }

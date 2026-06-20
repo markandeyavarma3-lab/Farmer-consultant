@@ -2,7 +2,7 @@
 .env
 .streamlit/secrets.toml
 
-# Vector store (rebuilt from knowledge_base/ on launch)
+# ChromaDB store (no longer used — replaced by vector_index.npz)
 chroma_store/
 
 # Python

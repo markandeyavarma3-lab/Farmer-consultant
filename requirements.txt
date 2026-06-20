@@ -4,9 +4,10 @@ streamlit>=1.40.0
 # LLM + Whisper (English STT) via Groq free tier
 groq>=0.11.0
 
-# RAG: local vector store + multilingual embeddings
-chromadb>=0.5.0
+# RAG: multilingual embeddings + numpy vector search (no chromadb — avoids
+# opentelemetry/protobuf which crash on Python 3.14 on Streamlit Cloud)
 sentence-transformers>=3.0.0
+numpy>=1.24.0
 
 # HTTP for Sarvam STT/TTS
 requests>=2.31.0

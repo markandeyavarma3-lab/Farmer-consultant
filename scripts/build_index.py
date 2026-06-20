@@ -18,7 +18,7 @@ from src.rag import build_index  # noqa: E402
 def main():
     print("Building vector index from knowledge_base/ ...")
     n = build_index(reset=True)
-    print(f"Done. Indexed {n} chunks into the Chroma store.")
+    print(f"Done. Indexed {n} chunks into vector_index.npz.")
 
 
 if __name__ == "__main__":
